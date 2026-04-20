@@ -1,4 +1,8 @@
 import os
+import asyncio
+import logging
+import yt_dlp
+
 from fastapi import FastAPI, Request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -10,21 +14,113 @@ from telegram.ext import (
     filters,
 )
 
-from config import BOT_TOKEN
-from queue import add_task
+# ---------------- CONFIG ----------------
+logging.basicConfig(level=logging.INFO)
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
 app = FastAPI()
-
-# ---------------- TELEGRAM APP ----------------
 application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-user_links = {}
+# ---------------- QUEUE SYSTEM ----------------
+queue = asyncio.Queue()
+user_data = {}
 
-# ---------------- START ----------------
+# ---------------- PROGRESS TRACKER ----------------
+progress_messages = {}
+
+def detect_platform(url: str):
+    if "tiktok" in url:
+        return "TikTok"
+    elif "facebook" in url or "fb" in url:
+        return "Facebook"
+    elif "youtu" in url:
+        return "YouTube"
+    return "Unknown"
+
+
+# ---------------- DOWNLOAD ENGINE ----------------
+def download_video(url, quality, progress_cb=None):
+
+    format_map = {
+        "720": "best[height<=720]",
+        "360": "best[height<=360]",
+        "best": "best",
+    }
+
+    def hook(d):
+        if d.get("status") == "downloading":
+            if progress_cb:
+                progress_cb(d.get("_percent_str", "0%"))
+
+    ydl_opts = {
+        "format": format_map.get(quality, "best"),
+        "outtmpl": "downloads/%(title).50s.%(ext)s",
+        "noplaylist": True,
+        "quiet": True,
+        "progress_hooks": [hook],
+    }
+
+    os.makedirs("downloads", exist_ok=True)
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        file_path = ydl.prepare_filename(info)
+
+    return file_path
+
+
+# ---------------- WORKER ----------------
+async def worker():
+    while True:
+        update, quality = await queue.get()
+
+        user_id = update.message.from_user.id
+        url = user_data.get(user_id)
+
+        if not url:
+            queue.task_done()
+            continue
+
+        msg = await update.message.reply_text("⏳ Starting download...")
+
+        def progress(p):
+            try:
+                asyncio.create_task(
+                    msg.edit_text(f"📥 Downloading... {p}")
+                )
+            except:
+                pass
+
+        try:
+            file_path = await asyncio.to_thread(
+                download_video, url, quality, progress
+            )
+
+            await msg.edit_text("📤 Uploading...")
+
+            await update.message.reply_video(
+                video=open(file_path, "rb"),
+                caption=f"✅ Done ({detect_platform(url)}) - {quality}"
+            )
+
+            os.remove(file_path)
+
+        except Exception as e:
+            logging.error(e)
+            await msg.edit_text("❌ Download failed")
+
+        queue.task_done()
+
+
+# ---------------- BOT HANDLERS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 V4 ULTRA PRO Bot is LIVE\nSend a link!")
+    await update.message.reply_text(
+        "🚀 V5 PRO MAX DOWNLOADER\nSend me a video link"
+    )
 
-# ---------------- HANDLE LINK ----------------
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
     user_id = update.message.from_user.id
@@ -33,7 +129,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid link")
         return
 
-    user_links[user_id] = url
+    user_data[user_id] = url
 
     keyboard = [
         [
@@ -44,44 +140,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     await update.message.reply_text(
-        "Choose quality:",
+        "🎬 Choose quality:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
-# ---------------- BUTTON ----------------
+
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    user_id = query.from_user.id
-    quality = query.data
-    url = user_links.get(user_id)
+    await queue.put((query, query.data))
+    await query.edit_message_text("🟡 Added to queue...")
 
-    if not url:
-        await query.edit_message_text("Session expired")
-        return
 
-    await query.edit_message_text("⏳ Processing...")
-
-    add_task(user_id, url, quality, application, query.message.chat_id)
-
-# ---------------- REGISTER HANDLERS ----------------
+# ---------------- REGISTER ----------------
 application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 application.add_handler(CallbackQueryHandler(button))
 
 
-# ---------------- FASTAPI WEBHOOK ----------------
-@app.on_event("startup")
-async def startup():
-    await application.initialize()
-    await application.start()
-    print("🤖 Bot initialized")
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    await application.stop()
+# ---------------- FASTAPI ----------------
+@app.get("/")
+def home():
+    return {"status": "V5 PRO MAX RUNNING 🚀"}
 
 
 @app.post("/webhook")
@@ -92,7 +173,20 @@ async def webhook(req: Request):
     return {"ok": True}
 
 
-# ---------------- HEALTH CHECK ----------------
-@app.get("/")
-def home():
-    return {"status": "V4 ULTRA PRO RUNNING 🚀"}
+# ---------------- STARTUP ----------------
+@app.on_event("startup")
+async def startup():
+    await application.initialize()
+    await application.start()
+
+    # start worker
+    asyncio.create_task(worker())
+
+    if WEBHOOK_URL:
+        await application.bot.set_webhook(WEBHOOK_URL)
+        logging.info(f"Webhook set: {WEBHOOK_URL}")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await application.stop()
